@@ -1,0 +1,37 @@
+# Build artifacts
+build/
+cmake-build-*/
+
+# Models (too large for git)
+models/
+*.gguf
+*.safetensors
+
+# Backup files
+*.bak
+*.bak20822
+*.pr20819.bak
+*.pr20822.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Compiled binaries (will be built by user)
+bin/llama-server
+bin/llama-cli
+bin/lib*.so*
+
+# Temporary
+*.tmp
+*.tmp.*
