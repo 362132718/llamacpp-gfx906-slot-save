@@ -2,6 +2,8 @@
 
 > Fork of [sixvolts/llamacpp-gfx906-furnace](https://github.com/sixvolts/llamacpp-gfx906-furnace) with automatic slot state persistence for seamless model hot-swapping.
 
+> **[中文文档 / Chinese Documentation](README_CN.md)**
+
 ## What This Adds
 
 This fork patches two upstream PRs onto the gfx906 furnace branch:
