@@ -581,6 +581,154 @@ struct server_slot {
 };
 
 
+//
+// checkpoint persistence helpers for hybrid/recurrent models
+//
+// Hybrid models (e.g. Qwen3.6, Jamba, Falcon-H1) use recurrent layers whose
+// state cannot be partially restored from the KV cache alone.  The server
+// creates "context checkpoints" during prompt processing that snapshot the
+// full recurrent state at regular intervals.  These checkpoints live in
+// server_prompt::checkpoints and are essential to avoid a full prompt
+// re-processing when the slot is reused.
+//
+// The built-in /slots save/restore API persists the raw KV+recurrent memory
+// via llama_state_seq_{save,load}_file, but does NOT persist the checkpoint
+// metadata.  The two helpers below fill that gap: they write/read a small
+// companion file (<filename>.checkpoints) next to the main slot save file.
+//
+// File format (binary, little-endian):
+//   uint32  magic    = 0x4C4C4350  ("LLCP")
+//   uint32  version  = 2  (dual-plane: data_tgt + data_dft)
+//   uint32  n_checkpoints
+//   For each checkpoint:
+//     int32   pos_min
+//     int32   pos_max
+//     int64   n_tokens
+//     uint64  data_tgt_size
+//     uint8   data_tgt[data_tgt_size]
+//     uint64  data_dft_size
+//     uint8   data_dft[data_dft_size]
+//
+
+static bool slot_checkpoints_save(const std::string & filepath,
+                                  const std::list<common_prompt_checkpoint> & checkpoints) {
+    if (checkpoints.empty()) {
+        return true;
+    }
+
+    const std::string cp_path = filepath + ".checkpoints";
+    FILE * fp = fopen(cp_path.c_str(), "wb");
+    if (!fp) {
+        SRV_WRN("failed to open checkpoint file for writing: %s\n", cp_path.c_str());
+        return false;
+    }
+
+    const uint32_t magic   = 0x4C4C4350;
+    const uint32_t version = 2;
+    const uint32_t n_cp    = (uint32_t) checkpoints.size();
+
+    bool ok = true;
+    ok = ok && fwrite(&magic,   sizeof(magic),   1, fp) == 1;
+    ok = ok && fwrite(&version, sizeof(version), 1, fp) == 1;
+    ok = ok && fwrite(&n_cp,    sizeof(n_cp),    1, fp) == 1;
+
+    for (const auto & cp : checkpoints) {
+        const uint64_t data_tgt_size = cp.data_tgt.size();
+        const uint64_t data_dft_size = cp.data_dft.size();
+        ok = ok && fwrite(&cp.pos_min,     sizeof(cp.pos_min),     1, fp) == 1;
+        ok = ok && fwrite(&cp.pos_max,     sizeof(cp.pos_max),     1, fp) == 1;
+        ok = ok && fwrite(&cp.n_tokens,    sizeof(cp.n_tokens),    1, fp) == 1;
+        ok = ok && fwrite(&data_tgt_size,  sizeof(data_tgt_size),  1, fp) == 1;
+        if (data_tgt_size > 0) {
+            ok = ok && fwrite(cp.data_tgt.data(), 1, data_tgt_size, fp) == data_tgt_size;
+        }
+        ok = ok && fwrite(&data_dft_size,  sizeof(data_dft_size),  1, fp) == 1;
+        if (data_dft_size > 0) {
+            ok = ok && fwrite(cp.data_dft.data(), 1, data_dft_size, fp) == data_dft_size;
+        }
+    }
+
+    fclose(fp);
+
+    if (!ok) {
+        SRV_WRN("failed to write checkpoint data to %s\n", cp_path.c_str());
+        std::remove(cp_path.c_str());
+        return false;
+    }
+
+    SRV_INF("saved %u context checkpoints to %s\n", n_cp, cp_path.c_str());
+    return true;
+}
+
+static bool slot_checkpoints_load(const std::string & filepath,
+                                  std::list<common_prompt_checkpoint> & checkpoints) {
+    const std::string cp_path = filepath + ".checkpoints";
+    FILE * fp = fopen(cp_path.c_str(), "rb");
+    if (!fp) {
+        // no companion file — not an error, just means no checkpoints to restore
+        return true;
+    }
+
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint32_t n_cp = 0;
+
+    bool ok = true;
+    ok = ok && fread(&magic,   sizeof(magic),   1, fp) == 1;
+    ok = ok && fread(&version, sizeof(version), 1, fp) == 1;
+    ok = ok && fread(&n_cp,    sizeof(n_cp),    1, fp) == 1;
+
+    if (!ok || magic != 0x4C4C4350) {
+        SRV_WRN("invalid checkpoint file header: %s\n", cp_path.c_str());
+        fclose(fp);
+        return false;
+    }
+
+    if (version != 2) {
+        SRV_WRN("unsupported checkpoint version %u in %s (expected 2)\n", version, cp_path.c_str());
+        fclose(fp);
+        return false;
+    }
+
+    checkpoints.clear();
+
+    for (uint32_t i = 0; i < n_cp; i++) {
+        common_prompt_checkpoint cp;
+        uint64_t data_tgt_size = 0;
+        uint64_t data_dft_size = 0;
+
+        ok = ok && fread(&cp.pos_min,     sizeof(cp.pos_min),     1, fp) == 1;
+        ok = ok && fread(&cp.pos_max,     sizeof(cp.pos_max),     1, fp) == 1;
+        ok = ok && fread(&cp.n_tokens,    sizeof(cp.n_tokens),    1, fp) == 1;
+        ok = ok && fread(&data_tgt_size,  sizeof(data_tgt_size),  1, fp) == 1;
+        if (data_tgt_size > 0) {
+            cp.data_tgt.resize(data_tgt_size);
+            ok = ok && fread(cp.data_tgt.data(), 1, data_tgt_size, fp) == data_tgt_size;
+        }
+        ok = ok && fread(&data_dft_size,  sizeof(data_dft_size),  1, fp) == 1;
+        if (data_dft_size > 0) {
+            cp.data_dft.resize(data_dft_size);
+            ok = ok && fread(cp.data_dft.data(), 1, data_dft_size, fp) == data_dft_size;
+        }
+
+        if (!ok) {
+            SRV_WRN("failed to read checkpoint %u from %s\n", i, cp_path.c_str());
+            fclose(fp);
+            checkpoints.clear();
+            return false;
+        }
+
+        checkpoints.push_back(std::move(cp));
+    }
+
+    fclose(fp);
+
+    SRV_INF("loaded %u context checkpoints from %s\n", n_cp, cp_path.c_str());
+    return true;
+}
+
+
+
 
 //
 // server_metrics
@@ -2252,6 +2400,9 @@ private:
                     const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
+
+                    // persist checkpoint metadata to disk
+                    slot_checkpoints_save(filepath, slot->prompt.checkpoints);
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2299,6 +2450,9 @@ private:
                     slot->prompt.tokens.clear();
                     slot->prompt.tokens.insert(tokens);
 
+
+                    // restore checkpoint metadata from disk
+                    slot_checkpoints_load(filepath, slot->prompt.checkpoints);
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 
@@ -3566,6 +3720,94 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+void server_context::auto_save_slots() {
+    const auto & params = impl->params_base;
+    if (params.slot_save_path.empty()) {
+        return;
+    }
+
+    for (auto & slot : impl->slots) {
+        if (slot.prompt.tokens.size() == 0) {
+            continue;
+        }
+
+        const std::string model_stem = std::filesystem::path(params.model.path).stem().string();
+        const std::string filepath   = params.slot_save_path + "/" + model_stem;
+
+        const llama_tokens & tokens = slot.prompt.tokens.get_text_tokens();
+        const size_t token_count    = slot.prompt.tokens.size();
+        // write to temp file first, then rename for crash safety
+        const std::string tmp_path  = filepath + ".tmp";
+        const std::string tmp_cp    = tmp_path + ".checkpoints";
+        const std::string final_cp  = filepath + ".checkpoints";
+
+        const size_t nwrite = llama_state_seq_save_file(impl->ctx_tgt, tmp_path.c_str(), slot.id, tokens.data(), token_count);
+
+        if (nwrite == 0) {
+            SRV_WRN("auto-save failed for slot %d (nwrite=0)\n", slot.id);
+            std::remove(tmp_path.c_str());
+            continue;
+        }
+
+        slot_checkpoints_save(tmp_path, slot.prompt.checkpoints);
+
+        // atomic rename: temp -> final
+        std::remove(filepath.c_str());
+        std::remove(final_cp.c_str());
+        std::rename(tmp_path.c_str(), filepath.c_str());
+        std::rename(tmp_cp.c_str(), final_cp.c_str());
+
+        SRV_INF("auto-saved slot %d (%zu tokens, %.1f MiB) to %s\n",
+            slot.id, token_count, (float) nwrite / (1024.0f * 1024.0f), filepath.c_str());
+    }
+}
+
+void server_context::auto_restore_slots() {
+    const auto & params = impl->params_base;
+    if (params.slot_save_path.empty()) {
+        return;
+    }
+
+    const std::string model_stem = std::filesystem::path(params.model.path).stem().string();
+    const std::string filepath   = params.slot_save_path + "/" + model_stem;
+
+    if (!std::filesystem::exists(filepath)) {
+        return;
+    }
+
+    // validate file size: a valid slot save should be > 1MB
+    // if file is too small, it was likely interrupted during write
+    {
+        const auto file_size = std::filesystem::file_size(filepath);
+        if (file_size < 1024 * 1024) {
+            SRV_WRN("auto-restore: %s is too small (%zu bytes), likely incomplete - skipping\n",
+                filepath.c_str(), file_size);
+            return;
+        }
+    }
+
+    for (auto & slot : impl->slots) {
+        llama_tokens tokens;
+        tokens.resize(slot.n_ctx);
+        size_t token_count = 0;
+        const size_t nread = llama_state_seq_load_file(impl->ctx_tgt, filepath.c_str(), slot.id, tokens.data(), tokens.size(), &token_count);
+
+        if (nread == 0) {
+            SRV_WRN("auto-restore failed for slot %d from %s\n", slot.id, filepath.c_str());
+            continue;
+        }
+
+        tokens.resize(token_count);
+        slot.prompt.tokens.clear();
+        slot.prompt.tokens.insert(tokens);
+
+        slot_checkpoints_load(filepath, slot.prompt.checkpoints);
+
+        SRV_INF("auto-restored slot %d (%zu tokens, %.1f MiB) from %s\n",
+            slot.id, token_count, (float) nread / (1024.0f * 1024.0f), filepath.c_str());
+    }
 }
 
 llama_context * server_context::get_llama_context() const {
